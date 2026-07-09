@@ -9,6 +9,7 @@ use futures::{future::join_all, Stream};
 use prost::bytes::{Bytes, BytesMut};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_stream::StreamExt;
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use super::generated::contextstore::kv::v1 as pb;
@@ -130,6 +131,38 @@ mod tests {
         assert_eq!(placement.chunks[0].node_id, "node-a");
         assert_eq!(placement.chunks[1].grpc_endpoint, "10.0.0.2:50051");
     }
+
+    #[test]
+    fn metadata_owner_matches_primary_data_node() {
+        let mut cfg = crate::config::Config::default();
+        cfg.cluster.node_id = "node-a".to_string();
+        cfg.cluster.grpc_advertise = "10.0.0.1:50051".to_string();
+        cfg.cluster.data_nodes = vec![
+            ClusterNodeConfig {
+                node_id: "node-a".to_string(),
+                grpc_endpoint: "10.0.0.1:50051".to_string(),
+                rdma_endpoint: String::new(),
+            },
+            ClusterNodeConfig {
+                node_id: "node-b".to_string(),
+                grpc_endpoint: "10.0.0.2:50051".to_string(),
+                rdma_endpoint: String::new(),
+            },
+            ClusterNodeConfig {
+                node_id: "node-c".to_string(),
+                grpc_endpoint: "10.0.0.3:50051".to_string(),
+                rdma_endpoint: String::new(),
+            },
+        ];
+        let tmp = tempfile::TempDir::new().unwrap();
+        cfg.metadata.rocksdb_path = tmp.path().join("meta");
+        let ctx = KVServiceContext::new(cfg).unwrap();
+
+        let owner = select_metadata_owner(&ctx, &key());
+        let primary = select_data_node(&ctx, &key(), 0);
+
+        assert_eq!(owner, primary);
+    }
 }
 
 impl KVServiceImpl {
@@ -170,6 +203,26 @@ impl KVServiceImpl {
 
     fn should_use_distributed_placement(&self, len: usize) -> bool {
         distributed_placement_enabled(&self.ctx, len)
+    }
+
+    async fn owner_client_for_key(
+        &self,
+        key: &InternalKey,
+    ) -> Result<Option<pb::kv_service_client::KvServiceClient<Channel>>, Status> {
+        let owner = select_metadata_owner(&self.ctx, key);
+        if is_local_node(&self.ctx, &owner) {
+            return Ok(None);
+        }
+        let client =
+            pb::kv_service_client::KvServiceClient::connect(grpc_uri(&owner.grpc_endpoint))
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!(
+                        "connect metadata owner {}: {}",
+                        owner.node_id, e
+                    ))
+                })?;
+        Ok(Some(client))
     }
 
     fn key_write_lock(&self, key: &InternalKey) -> Arc<AsyncMutex<()>> {
@@ -584,6 +637,27 @@ fn put_options_if_not_exists(options: Option<&pb::PutOptions>) -> bool {
     options.map(|opts| opts.if_not_exists).unwrap_or(false)
 }
 
+fn missing_get_response() -> pb::GetResponse {
+    pb::GetResponse {
+        data: Bytes::new(),
+        metadata: None,
+        found: false,
+    }
+}
+
+fn memory_get_result_to_pb(
+    result: crate::error::Result<Option<(Bytes, BlockMeta)>>,
+) -> pb::GetResponse {
+    match result {
+        Ok(Some((data, meta))) => pb::GetResponse {
+            data,
+            metadata: Some(meta_to_pb(&meta)),
+            found: true,
+        },
+        _ => missing_get_response(),
+    }
+}
+
 fn grpc_uri(endpoint: &str) -> String {
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         endpoint.to_string()
@@ -657,6 +731,22 @@ fn select_data_node(ctx: &KVServiceContext, key: &InternalKey, stripe_index: usi
     let nodes = configured_data_nodes(ctx);
     let base = (hash64(key.to_string_key().as_bytes()) as usize) % nodes.len();
     nodes[(base + stripe_index) % nodes.len()].clone()
+}
+
+fn select_metadata_owner(ctx: &KVServiceContext, key: &InternalKey) -> DataNode {
+    select_data_node(ctx, key, 0)
+}
+
+fn push_node_group<T>(groups: &mut Vec<(DataNode, Vec<T>)>, node: DataNode, item: T) {
+    if let Some((_, items)) = groups.iter_mut().find(|(existing, _)| {
+        existing.node_id.as_str() == node.node_id.as_str()
+            && existing.grpc_endpoint.as_str() == node.grpc_endpoint.as_str()
+            && existing.rdma_endpoint.as_str() == node.rdma_endpoint.as_str()
+    }) {
+        items.push(item);
+        return;
+    }
+    groups.push((node, vec![item]));
 }
 
 fn chunk_location_to_pb(key: &InternalKey, loc: &ChunkLocation) -> pb::PlacementChunk {
@@ -851,6 +941,9 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .key
                 .ok_or_else(|| Status::invalid_argument("missing key"))?;
             let internal = pb_key_to_internal(&key);
+            if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+                return client.get(pb::GetRequest { key: Some(key) }).await;
+            }
             let str_key = internal.to_string_key();
             let meta_ctx = self.ctx.clone();
             let meta = tokio::task::spawn_blocking(move || meta_ctx.metadata.get_block(&str_key))
@@ -907,10 +1000,20 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .key
                 .ok_or_else(|| Status::invalid_argument("missing key"))?;
             let internal = pb_key_to_internal(&key);
-            let meta = meta_from_pb(req.metadata.as_ref());
-            let if_not_exists = put_options_if_not_exists(req.options.as_ref());
             // pb::PutRequest.data is Bytes (a buffer reference handed over by the gRPC framework, no copy)
             let data: Bytes = req.data;
+            if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+                return client
+                    .put(pb::PutRequest {
+                        key: Some(key),
+                        data,
+                        metadata: req.metadata,
+                        options: req.options,
+                    })
+                    .await;
+            }
+            let meta = meta_from_pb(req.metadata.as_ref());
+            let if_not_exists = put_options_if_not_exists(req.options.as_ref());
             if self.should_use_distributed_placement(data.len()) {
                 let inserted = if if_not_exists {
                     self.put_distributed_bytes_if_absent(internal, data, meta)
@@ -963,6 +1066,11 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             .key
             .ok_or_else(|| Status::invalid_argument("missing key"))?;
         let internal = pb_key_to_internal(&key);
+        if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+            return client
+                .delete(pb::DeleteRequest { key: Some(key) })
+                .await;
+        }
         let str_key = internal.to_string_key();
         let meta_ctx = self.ctx.clone();
         let meta = tokio::task::spawn_blocking(move || meta_ctx.metadata.get_block(&str_key))
@@ -998,6 +1106,11 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
             .key
             .ok_or_else(|| Status::invalid_argument("missing key"))?;
         let internal = pb_key_to_internal(&key);
+        if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+            return client
+                .exists(pb::ExistsRequest { key: Some(key) })
+                .await;
+        }
         let ctx = self.ctx.clone();
         let ok = tokio::task::spawn_blocking(move || ctx.memory.exists(&internal))
             .await
@@ -1017,6 +1130,11 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .key
                 .ok_or_else(|| Status::invalid_argument("missing key"))?;
             let internal = pb_key_to_internal(&key);
+            if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+                return client
+                    .lookup_object(pb::LookupObjectRequest { key: Some(key) })
+                    .await;
+            }
             let str_key = internal.to_string_key();
             let ctx = self.ctx.clone();
             let meta = tokio::task::spawn_blocking(move || ctx.metadata.get_block(&str_key))
@@ -1054,6 +1172,14 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .descriptor
                 .ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
             let internal = key_from_descriptor(&descriptor)?;
+            if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+                return client
+                    .read_by_descriptor(pb::ReadByDescriptorRequest {
+                        descriptor: Some(descriptor),
+                        placement: req.placement,
+                    })
+                    .await;
+            }
             let str_key = internal.to_string_key();
             let meta_ctx = self.ctx.clone();
             let meta_task =
@@ -1255,28 +1381,72 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         req: Request<pb::GetBatchRequest>,
     ) -> Result<Response<pb::GetBatchResponse>, Status> {
         let req = req.into_inner();
-        let keys: Vec<InternalKey> = req.keys.iter().map(pb_key_to_internal).collect();
-        let ctx = self.ctx.clone();
-        let results = tokio::task::spawn_blocking(move || ctx.memory.get_batch(&keys))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let pb_results: Vec<pb::GetResponse> = results
-            .into_iter()
-            .map(|r| match r {
-                Ok(Some((d, m))) => pb::GetResponse {
-                    data: d,
-                    metadata: Some(meta_to_pb(&m)),
-                    found: true,
-                },
-                _ => pb::GetResponse {
-                    data: Bytes::new(),
-                    metadata: None,
-                    found: false,
-                },
-            })
-            .collect();
+        let mut local_keys: Vec<(usize, InternalKey)> = Vec::new();
+        let mut remote_groups: Vec<(DataNode, Vec<(usize, pb::ObjectKey)>)> = Vec::new();
+        let total = req.keys.len();
+
+        for (idx, key) in req.keys.into_iter().enumerate() {
+            let internal = pb_key_to_internal(&key);
+            let owner = select_metadata_owner(&self.ctx, &internal);
+            if is_local_node(&self.ctx, &owner) {
+                local_keys.push((idx, internal));
+            } else {
+                push_node_group(&mut remote_groups, owner, (idx, key));
+            }
+        }
+
+        let mut results: Vec<Option<pb::GetResponse>> = (0..total).map(|_| None).collect();
+
+        if !local_keys.is_empty() {
+            let batch_keys: Vec<InternalKey> =
+                local_keys.iter().map(|(_, key)| key.clone()).collect();
+            let ctx = self.ctx.clone();
+            let local_results =
+                tokio::task::spawn_blocking(move || ctx.memory.get_batch(&batch_keys))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            for ((idx, _), result) in local_keys.into_iter().zip(local_results.into_iter()) {
+                results[idx] = Some(memory_get_result_to_pb(result));
+            }
+        }
+
+        for (node, entries) in remote_groups {
+            let mut client =
+                pb::kv_service_client::KvServiceClient::connect(grpc_uri(&node.grpc_endpoint))
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!(
+                            "connect metadata owner {}: {}",
+                            node.node_id, e
+                        ))
+                    })?;
+            let indexes: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
+            let keys: Vec<pb::ObjectKey> = entries.into_iter().map(|(_, key)| key).collect();
+            let response = client
+                .get_batch(pb::GetBatchRequest { keys })
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("get batch from {}: {}", node.node_id, e))
+                })?
+                .into_inner();
+            if response.results.len() != indexes.len() {
+                return Err(Status::internal(format!(
+                    "metadata owner {} returned {} get results for {} keys",
+                    node.node_id,
+                    response.results.len(),
+                    indexes.len()
+                )));
+            }
+            for (idx, result) in indexes.into_iter().zip(response.results.into_iter()) {
+                results[idx] = Some(result);
+            }
+        }
+
         Ok(Response::new(pb::GetBatchResponse {
-            results: pb_results,
+            results: results
+                .into_iter()
+                .map(|result| result.unwrap_or_else(missing_get_response))
+                .collect(),
         }))
     }
 
@@ -1286,45 +1456,106 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
     ) -> Result<Response<pb::PutBatchResponse>, Status> {
         let req = req.into_inner();
         // item.data is Bytes (a refcounted view over the gRPC framework buffer)
-        let mut items: Vec<(InternalKey, Bytes, BlockMeta, bool)> =
+        let mut local_items: Vec<(usize, InternalKey, Bytes, BlockMeta, bool)> =
             Vec::with_capacity(req.items.len());
+        let mut remote_groups: Vec<(DataNode, Vec<(usize, pb::PutRequest)>)> = Vec::new();
         let mut has_if_not_exists = false;
-        for item in req.items {
-            let k = item
+        let total = req.items.len();
+
+        for (idx, item) in req.items.into_iter().enumerate() {
+            let key = item
                 .key
+                .clone()
                 .ok_or_else(|| Status::invalid_argument("missing key in batch item"))?;
-            let m = meta_from_pb(item.metadata.as_ref());
-            let if_not_exists = put_options_if_not_exists(item.options.as_ref());
-            has_if_not_exists |= if_not_exists;
-            items.push((pb_key_to_internal(&k), item.data, m, if_not_exists));
+            let internal = pb_key_to_internal(&key);
+            let owner = select_metadata_owner(&self.ctx, &internal);
+            if is_local_node(&self.ctx, &owner) {
+                let meta = meta_from_pb(item.metadata.as_ref());
+                let if_not_exists = put_options_if_not_exists(item.options.as_ref());
+                has_if_not_exists |= if_not_exists;
+                local_items.push((idx, internal, item.data, meta, if_not_exists));
+            } else {
+                push_node_group(&mut remote_groups, owner, (idx, item));
+            }
         }
-        let ctx = self.ctx.clone();
-        let success = if has_if_not_exists {
-            tokio::task::spawn_blocking(move || {
-                items
-                    .into_iter()
-                    .map(|(key, data, meta, if_not_exists)| {
-                        if if_not_exists {
-                            ctx.memory.put_if_absent(&key, data, meta)
-                        } else {
-                            ctx.memory.put(&key, data, meta).map(|_| true)
-                        }
-                        .unwrap_or(false)
-                    })
-                    .collect::<Vec<bool>>()
-            })
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-        } else {
-            let batch_items = items
-                .into_iter()
-                .map(|(key, data, meta, _)| (key, data, meta))
-                .collect();
-            let results = tokio::task::spawn_blocking(move || ctx.memory.put_batch(batch_items))
+
+        let mut success = vec![false; total];
+
+        if !local_items.is_empty() {
+            let ctx = self.ctx.clone();
+            let indexed_success = if has_if_not_exists {
+                tokio::task::spawn_blocking(move || {
+                    local_items
+                        .into_iter()
+                        .map(|(idx, key, data, meta, if_not_exists)| {
+                            let ok = if if_not_exists {
+                                ctx.memory.put_if_absent(&key, data, meta)
+                            } else {
+                                ctx.memory.put(&key, data, meta).map(|_| true)
+                            }
+                            .unwrap_or(false);
+                            (idx, ok)
+                        })
+                        .collect::<Vec<(usize, bool)>>()
+                })
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            results.iter().map(|r| r.is_ok()).collect()
-        };
+                .map_err(|e| Status::internal(e.to_string()))?
+            } else {
+                let indexes: Vec<usize> = local_items
+                    .iter()
+                    .map(|(idx, _, _, _, _)| *idx)
+                    .collect();
+                let batch_items = local_items
+                    .into_iter()
+                    .map(|(_, key, data, meta, _)| (key, data, meta))
+                    .collect();
+                let results =
+                    tokio::task::spawn_blocking(move || ctx.memory.put_batch(batch_items))
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                indexes
+                    .into_iter()
+                    .zip(results.into_iter().map(|result| result.is_ok()))
+                    .collect()
+            };
+            for (idx, ok) in indexed_success {
+                success[idx] = ok;
+            }
+        }
+
+        for (node, entries) in remote_groups {
+            let mut client =
+                pb::kv_service_client::KvServiceClient::connect(grpc_uri(&node.grpc_endpoint))
+                    .await
+                    .map_err(|e| {
+                        Status::unavailable(format!(
+                            "connect metadata owner {}: {}",
+                            node.node_id, e
+                        ))
+                    })?;
+            let indexes: Vec<usize> = entries.iter().map(|(idx, _)| *idx).collect();
+            let items: Vec<pb::PutRequest> =
+                entries.into_iter().map(|(_, item)| item).collect();
+            let response = client
+                .put_batch(pb::PutBatchRequest { items })
+                .await
+                .map_err(|e| {
+                    Status::unavailable(format!("put batch to {}: {}", node.node_id, e))
+                })?
+                .into_inner();
+            if response.success.len() != indexes.len() {
+                return Err(Status::internal(format!(
+                    "metadata owner {} returned {} put results for {} items",
+                    node.node_id,
+                    response.success.len(),
+                    indexes.len()
+                )));
+            }
+            for (idx, ok) in indexes.into_iter().zip(response.success.into_iter()) {
+                success[idx] = ok;
+            }
+        }
+
         Ok(Response::new(pb::PutBatchResponse { success }))
     }
 
@@ -1347,6 +1578,14 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .key
                 .ok_or_else(|| Status::invalid_argument("missing key"))?;
             let internal = pb_key_to_internal(&key);
+            if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+                let response = client
+                    .get_stream(pb::GetRequest { key: Some(key) })
+                    .await?;
+                return Ok(Response::new(
+                    Box::pin(response.into_inner()) as Self::GetStreamStream
+                ));
+            }
             let str_key = internal.to_string_key();
             let meta_ctx = self.ctx.clone();
             let meta = tokio::task::spawn_blocking(move || meta_ctx.metadata.get_block(&str_key))
@@ -1438,6 +1677,17 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
                 .descriptor
                 .ok_or_else(|| Status::invalid_argument("missing descriptor"))?;
             let internal = key_from_descriptor(&descriptor)?;
+            if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+                let response = client
+                    .read_by_descriptor_stream(pb::ReadByDescriptorRequest {
+                        descriptor: Some(descriptor),
+                        placement: req.placement,
+                    })
+                    .await?;
+                return Ok(Response::new(
+                    Box::pin(response.into_inner()) as Self::ReadByDescriptorStreamStream
+                ));
+            }
             let str_key = internal.to_string_key();
             let meta_ctx = self.ctx.clone();
             let meta_task =
@@ -1561,43 +1811,56 @@ impl pb::kv_service_server::KvService for KVServiceImpl {
         let request_start = Instant::now();
         let t0 = std::time::Instant::now();
         let mut stream = req.into_inner();
-        let mut key: Option<pb::ObjectKey> = None;
-        let mut meta_opt: Option<pb::KvMetadata> = None;
-        let mut options_opt: Option<pb::PutOptions> = None;
-        let mut segments: Vec<Bytes> = Vec::new();
-        let mut declared_total: i64 = 0;
+        let mut chunks: Vec<pb::PutChunk> = Vec::new();
         let mut got_first = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if !got_first {
-                key = chunk.key;
-                meta_opt = chunk.metadata;
-                options_opt = chunk.options;
-                declared_total = chunk.total_size;
-                if declared_total > 0 {
-                    segments.reserve(((declared_total as usize) / (2 * 1024 * 1024)).max(8));
+                if chunk.total_size > 0 {
+                    chunks.reserve(((chunk.total_size as usize) / (2 * 1024 * 1024)).max(8));
                 }
                 got_first = true;
             }
-            // chunk.data is Bytes (a refcounted view decoded by gRPC, zero-copy)
-            segments.push(chunk.data);
-            if chunk.is_last {
+            let is_last = chunk.is_last;
+            chunks.push(chunk);
+            if is_last {
                 break;
             }
         }
         let t_recv_done = t0.elapsed();
 
-        if segments.is_empty() {
+        if chunks.is_empty() {
             let result = Err(Status::invalid_argument("empty stream"));
             self.record_request("put_stream", request_start, &result, "ok");
             return result;
         }
-        let key = key.ok_or_else(|| Status::invalid_argument("first chunk must include key"))?;
+        let (key, meta_opt, options_opt, declared_total) = {
+            let first = chunks
+                .first()
+                .ok_or_else(|| Status::invalid_argument("empty stream"))?;
+            let key = first
+                .key
+                .clone()
+                .ok_or_else(|| Status::invalid_argument("first chunk must include key"))?;
+            (
+                key,
+                first.metadata.clone(),
+                first.options.clone(),
+                first.total_size,
+            )
+        };
         let internal = pb_key_to_internal(&key);
+        if let Some(mut client) = self.owner_client_for_key(&internal).await? {
+            let result = client.put_stream(tokio_stream::iter(chunks)).await;
+            self.record_request("put_stream", request_start, &result, "ok");
+            return result;
+        }
         let m = meta_from_pb(meta_opt.as_ref());
         let if_not_exists = put_options_if_not_exists(options_opt.as_ref());
         let ctx = self.ctx.clone();
+        // chunk.data is Bytes (a refcounted view decoded by gRPC, zero-copy)
+        let segments: Vec<Bytes> = chunks.into_iter().map(|chunk| chunk.data).collect();
         let total_bytes: usize = segments.iter().map(|s| s.len()).sum();
         let n_segs = segments.len();
         if self.should_use_distributed_placement(total_bytes) {
